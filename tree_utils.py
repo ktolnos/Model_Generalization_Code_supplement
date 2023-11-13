@@ -1,7 +1,8 @@
-from jax import numpy as jnp
 import jax as jx
+from jax import numpy as jnp
 
-#Adapted from https://gist.github.com/willwhitney/dd89cac6a5b771ccff18b06b33372c75
+
+# Adapted from https://gist.github.com/willwhitney/dd89cac6a5b771ccff18b06b33372c75
 
 def tree_stack(trees):
     """Takes a list of trees and stacks every corresponding leaf.
@@ -20,6 +21,7 @@ def tree_stack(trees):
     grouped_leaves = zip(*leaves_list)
     result_leaves = [jnp.stack(l) for l in grouped_leaves]
     return treedef_list[0].unflatten(result_leaves)
+
 
 def tree_unstack(tree):
     """Takes a tree and turns it into a list of trees. Inverse of tree_stack.
