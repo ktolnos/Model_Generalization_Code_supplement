@@ -311,6 +311,113 @@ class ProcMaze:
         return self._num_actions
 
 
+class EnemyWalk:
+    def __init__(self, grid_size=3, num_enemies=1, spontaneous_termination=True, teleport_on_termination=True):
+        self.num_enemies = num_enemies
+        self.move_map = jnp.asarray([[0, 0], [-1, 0], [0, -1], [1, 0], [0, 1]])
+
+        self._num_actions = 5
+        self.grid_size = grid_size
+
+        # 1/20th as often as the optimal time to solve the worst case maze for a given grid size
+        if (spontaneous_termination):
+            self.spontaneous_goal_probability = 0.05 / (
+                        (self.grid_size + 1) * ceil(self.grid_size / 2) - self.grid_size % 2)
+        else:
+            self.spontaneous_goal_probability = 0.0
+
+        self.teleport_on_termination = teleport_on_termination
+
+        self.channels = {
+            'player': 0,
+            'goal': 1,
+            'enemy': 2,
+            'empty': 3
+        }
+
+    @partial(jit, static_argnums=(0,))
+    def step(self, key, env_state, action):
+        goal, enemy_coords, pos = env_state
+
+        # Reset the step after if goal is reached, so agent sees the state where pos==goal
+        def is_on_enemy(i, was_on_enemy):
+            return jnp.logical_or(was_on_enemy, jnp.array_equal(enemy_coords[i], pos))
+        on_enemy = jx.lax.fori_loop(0, self.num_enemies, is_on_enemy, False)
+        terminal = jnp.logical_or(jnp.array_equal(pos, goal), on_enemy)
+
+        # punish agent for each step until termination
+        reward = jx.lax.cond(on_enemy, lambda: -1.0, lambda: -0.01)
+
+        # Move if the new position is on the grid and open
+        pos = jnp.clip(pos + self.move_map[action], 0, self.grid_size - 1)
+
+        # With small probability, teleport to goal
+        key, subkey = jx.random.split(key)
+        spontanteous_goal = jx.random.bernoulli(subkey, p=self.spontaneous_goal_probability)
+        if (self.teleport_on_termination):
+            pos = jnp.where(spontanteous_goal, goal, pos)
+        else:
+            terminal = jnp.logical_or(terminal, spontanteous_goal)
+
+        def move_enemy(i, carry):
+            key, enemy_coords = carry
+            key, subkey = jx.random.split(key)
+            move = jx.random.choice(key, 4) + 1
+            enemy_pos = jnp.clip(enemy_coords[i] + self.move_map[move], 0, self.grid_size - 1)
+            enemy_coords = enemy_coords.at[i].set(enemy_pos)
+            return subkey, enemy_coords
+        key, enemy_coords = jx.lax.fori_loop(0, self.num_enemies, move_enemy, (key, enemy_coords))
+
+        env_state = goal, enemy_coords, pos
+        return env_state, self.get_observation(env_state), reward, terminal, {}
+
+    @partial(jit, static_argnums=(0,))
+    def reset(self, key):
+        key, subkey = jx.random.split(key)
+        pos = jx.random.choice(subkey, self.grid_size * self.grid_size)
+        pos = jnp.stack(list(jnp.unravel_index(pos, (self.grid_size, self.grid_size))))
+        key, subkey = jx.random.split(key)
+        goal = jx.random.choice(subkey, self.grid_size * self.grid_size)
+        goal = jnp.stack(list(jnp.unravel_index(goal, (self.grid_size, self.grid_size))))
+
+        empty_grid = jnp.ones((self.grid_size, self.grid_size), dtype=bool)
+        enemy_coords = jnp.zeros((self.num_enemies, 2), dtype=int)
+        empty_grid = empty_grid.at[pos[0], pos[1]].set(0)
+        empty_grid = empty_grid.at[goal[0], goal[1]].set(0)
+
+        def add_enemy(i, carry):
+            key, empty_grid, enemy_coords = carry
+            key, subkey = jx.random.split(key)
+            enemy_pos = jx.random.choice(subkey, self.grid_size * self.grid_size, p=jnp.ravel(empty_grid))
+            enemy_pos = jnp.stack(list(jnp.unravel_index(enemy_pos, (self.grid_size, self.grid_size))))
+            empty_grid = empty_grid.at[enemy_pos[0], enemy_pos[1]].set(0)
+            enemy_coords = enemy_coords.at[i].set(enemy_pos)
+            return subkey, empty_grid, enemy_coords
+
+        key, empty_grid, enemy_coords = jx.lax.fori_loop(0, self.num_enemies, add_enemy,
+                                                         (key, empty_grid, enemy_coords))
+
+        env_state = goal, enemy_coords, pos
+        return env_state, self.get_observation(env_state)
+
+    @partial(jit, static_argnums=(0,))
+    def get_observation(self, env_state):
+        goal, enemy_list, pos = env_state
+        obs = jnp.zeros((self.grid_size, self.grid_size, len(self.channels)), dtype=bool)
+        obs = obs.at[pos[0], pos[1], self.channels['player']].set(True)
+        obs = obs.at[goal[0], goal[1], self.channels['goal']].set(True)
+
+        def set_enemy(i, obs):
+            return obs.at[enemy_list[i, 0], enemy_list[i, 1], self.channels['enemy']].set(True)
+
+        obs = jx.lax.fori_loop(0, len(enemy_list), set_enemy, obs)
+        # Flatten obs so we can input to a feed forward network, could skip this if you want to use a conv net
+        return jnp.ravel(obs)
+
+    def num_actions(self):
+        return self._num_actions
+
+
 class OpenGrid:
     def __init__(self, grid_size=10, spontaneous_termination=True, teleport_on_termination=True):
         # 0: no-op, 1: up, 2: left, 3: down, 4: right

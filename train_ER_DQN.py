@@ -151,7 +151,7 @@ def get_agent_eval_function_episodic(env, Q_function, get_agent_params, num_iter
 
         (env_state, agent_opt_state, total_reward, phi, _, _), _ = jx.lax.scan(loop_function, carry, None,
                                                                                length=num_iterations)
-
+        # TODO  WTF? num_iterations is fixed, env is reset once
         return total_reward
 
     return jit(agent_eval_function_episodic)
@@ -335,7 +335,7 @@ with open(args.output + ".out", 'wb') as f:
 
 # save params once more at the end
 if (config.save_params):
-    with open(args.output + ".params", 'wb') as f:
+    with open('out/' + args.output + ".params", 'wb') as f:
         pkl.dump({
             'Q': [get_params(opt_state) for opt_state in tree_unstack(opt_states)]
         }, f)

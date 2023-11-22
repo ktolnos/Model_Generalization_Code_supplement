@@ -12,7 +12,7 @@
  "target_update_frequency":100,
  "use_target":true,
  "buffer_size":100000,
- "num_steps":100000,
+ "num_steps":200000,
  "gamma":0.9,
  "training_start_time":1000,
  "eval_frequency":500,
@@ -20,10 +20,11 @@
  "save_frequency":100000,
  "eval_steps":100,
  "eval_batch_size":32,
- "environment":"ProcMaze",
+ "environment":"EnemyWalk",
  "episodic_env":true,
  "env_config":{
-    "grid_size":3
+    "grid_size": 3,
+    "num_enemies": 1
  },
  "activation":"elu"}
 

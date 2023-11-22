@@ -763,7 +763,7 @@ for i in tqdm(range(config.num_steps // config.eval_frequency)):
     tqdm.write(write_string)
     time_since_last_save += config.eval_frequency
 
-with open(args.output + ".out", 'wb') as f:
+with open('out/' + args.output + ".out", 'wb') as f:
     pkl.dump({
         'config': config,
         'metrics': metrics
@@ -771,7 +771,7 @@ with open(args.output + ".out", 'wb') as f:
 
 # save params once more at the end
 if (config.save_params):
-    with open(args.output + ".params", 'wb') as f:
+    with open('out/' + args.output + ".params", 'wb') as f:
         pkl.dump({
             'model': [get_model_params(model_opt_state) for model_opt_state in tree_unstack(model_opt_states)],
             'Q': [get_Q_params(Q_opt_state) for Q_opt_state in tree_unstack(Q_opt_states)]
