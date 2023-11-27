@@ -338,18 +338,19 @@ class EnemyWalk:
     @partial(jit, static_argnums=(0,))
     def step(self, key, env_state, action):
         goal, enemy_coords, pos = env_state
+        terminal = jnp.array_equal(pos, goal)
 
-        # Reset the step after if goal is reached, so agent sees the state where pos==goal
         def is_on_enemy(i, was_on_enemy):
             return jnp.logical_or(was_on_enemy, jnp.array_equal(enemy_coords[i], pos))
+
         on_enemy = jx.lax.fori_loop(0, self.num_enemies, is_on_enemy, False)
-        terminal = jnp.logical_or(jnp.array_equal(pos, goal), on_enemy)
 
         # punish agent for each step until termination
-        reward = jx.lax.cond(on_enemy, lambda: -1.0, lambda: -0.01)
+        reward = jx.lax.cond(on_enemy, lambda: -1.0, lambda: -0.05)
 
-        # Move if the new position is on the grid and open
-        pos = jnp.clip(pos + self.move_map[action], 0, self.grid_size - 1)
+        # Move if the new position is on the grid
+        pos = jnp.clip(pos + self.move_map[action], 0,
+                       self.grid_size - 1)
 
         # With small probability, teleport to goal
         key, subkey = jx.random.split(key)

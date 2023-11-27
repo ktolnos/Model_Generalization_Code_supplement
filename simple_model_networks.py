@@ -28,10 +28,10 @@ class reward_function(hk.Module):
         self.activation_function = activation_dict[config.activation]
 
     def __call__(self, obs, action, key=None):
-        x = jnp.concatenate([jnp.ravel(obs), action])
+        x = jnp.hstack([obs, action])
         for i in range(self.num_hidden_layers):
             x = self.activation_function(hk.Linear(self.num_hidden_units)(x))
-        mu = hk.Linear(1)(x)[0]
+        mu = hk.Linear(1)(x).flatten().squeeze()
         sigma = jnp.ones(mu.shape)
         return {'mu': mu, 'sigma': sigma}
 
@@ -44,10 +44,10 @@ class termination_function(hk.Module):
         self.activation_function = activation_dict[config.activation]
 
     def __call__(self, obs, action, key=None):
-        x = jnp.concatenate([jnp.ravel(obs), action])
+        x = jnp.hstack([obs, action])
         for i in range(self.num_hidden_layers):
             x = self.activation_function(hk.Linear(self.num_hidden_units)(x))
-        logit = hk.Linear(1)(x)[0]
+        logit = hk.Linear(1)(x).flatten().squeeze()
         return {'logit': logit}
 
 
@@ -61,7 +61,7 @@ class next_obs_function(hk.Module):
         self.activation_function = activation_dict[config.activation]
 
     def __call__(self, obs, action, key):
-        x = jnp.concatenate([jnp.ravel(obs), action])
+        x = jnp.hstack([obs, action])
         for i in range(self.num_hidden_layers):
             x = self.activation_function(hk.Linear(self.num_hidden_units)(x))
         if (self.binary_obs):

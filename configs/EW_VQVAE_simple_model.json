@@ -36,5 +36,8 @@
 "latent_dim": 8,
 "num_embeddings": 16,
 "commitment_cost": 1,
-"embedding_decay": 0.99
+"embedding_decay": 0.99,
+"embed_reward":false,
+"embed_termination":false,
+"embed_next_obs":true
 }

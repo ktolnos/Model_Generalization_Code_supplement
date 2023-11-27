@@ -18,9 +18,9 @@ from tree_utils import tree_stack, tree_unstack
 activation_dict = {"relu": jx.nn.relu, "silu": jx.nn.silu, "elu": jx.nn.elu}
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--seed", "-s", type=int, default=0)
-parser.add_argument("--output", "-o", type=str, default="ER")
-parser.add_argument("--config", "-c", type=str)
+parser.add_argument("--seed", "-s", type=int, default=10)
+parser.add_argument("--output", "-o", type=str, default="ENEMY_WALK")
+parser.add_argument("--config", "-c", type=str, default='configs/ENEMY_WALK.json')
 args = parser.parse_args()
 key = jx.random.PRNGKey(args.seed)
 
@@ -327,7 +327,7 @@ for i in tqdm(range(config.num_steps // config.eval_frequency)):
     tqdm.write(write_string)
     time_since_last_save += config.eval_frequency
 
-with open(args.output + ".out", 'wb') as f:
+with open('out/' + args.output + ".out", 'wb') as f:
     pkl.dump({
         'config': config,
         'metrics': metrics
