@@ -39,5 +39,9 @@
 "embedding_decay": 0.99,
 "embed_reward":false,
 "embed_termination":false,
-"embed_next_obs":true
+"embed_next_obs":true,
+"obs_mi": false,
+"act_mi": false,
+"mi_loss_weight": 0,
+"embedding_prior": true
 }
