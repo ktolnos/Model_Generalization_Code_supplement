@@ -157,7 +157,7 @@ def get_single_batch_model_loss(model_functions, mi_functions, binary_obs):
 
 
 def get_single_sample_Q_loss(Q_function):
-    def single_sample_Q_loss(Q_params, Q_target_params, curr_obs, action, reward, next_obs, continuation_prob, weight):
+    def single_sample_Q_loss(Q_params, Q_target_params, curr_obs, action, reward, next_obs, continuation_prob, weight, embedding_indices):
         Q_curr = Q_function(Q_params, curr_obs)[action]
         if (config.double_DQN):
             Q_next = Q_function(SG(Q_target_params), next_obs)[jnp.argmax(Q_function(SG(Q_params), next_obs))]
@@ -167,6 +167,34 @@ def get_single_sample_Q_loss(Q_function):
 
     return single_sample_Q_loss
 
+def get_single_sample_env_Q_loss(env_Q_function, Q_function, mi_functions):
+    embedding_prior_network = mi_functions['embedding_prior']
+
+    def single_sample_env_Q_loss(env_Q_params, env_Q_target_params,
+                                 Q_target_params, mi_params, curr_obs, action, reward, next_obs,
+                                 continuation_prob, weight, embedding_indices):
+        embedding_prior_params = mi_params['embedding_prior']
+        env_Q_curr = env_Q_function(env_Q_params, curr_obs,
+                                    jnp.eye(num_actions)[action].squeeze())[embedding_indices]
+        next_action = jnp.argmax(Q_function(SG(Q_target_params), next_obs))
+        next_action_onehot = jnp.eye(num_actions)[next_action]
+
+        prior_mask = jnp.zeros((config.num_embeddings,), dtype=bool)
+        if config.embedding_prior:
+            next_embedding_categorical = SG(embedding_prior_network(
+                embedding_prior_params, next_obs, next_action_onehot))
+            prior_mask = jnp.where(
+                jnp.greater(jx.nn.softmax(next_embedding_categorical['logits']), config.min_env_Q_prior),
+                0, -jnp.inf)
+
+        if config.double_DQN:
+            env_Q_next = env_Q_function(SG(env_Q_target_params), next_obs, next_action_onehot)[
+                jnp.argmax(prior_mask + env_Q_function(SG(env_Q_params), next_obs, next_action_onehot))]
+        else:
+            env_Q_next = jnp.max(prior_mask + env_Q_function(SG(env_Q_target_params), next_obs, next_action_onehot))
+        return weight * (env_Q_curr - (-reward + config.gamma * continuation_prob * env_Q_next)) ** 2
+
+    return single_sample_env_Q_loss
 
 def get_single_batch_mi_loss(mi_functions, model_functions, binary_obs):
     def single_batch_mi_loss(mi_params, model_params, model_states, curr_obs, action, reward, next_obs, terminal, metrics, key):
@@ -223,12 +251,12 @@ def get_single_batch_mi_loss(mi_functions, model_functions, binary_obs):
     return single_batch_mi_loss
 
 
-def get_single_model_rollout_func(model_functions, mi_functions, Q_function, rollout_length, num_actions):
-    def single_model_rollout_func(initial_obs, model_params, model_states, mi_params, Q_params, key):
+def get_single_model_rollout_func(model_functions, mi_functions, Q_function, env_Q_function, rollout_length, num_actions):
+    def single_model_rollout_func(initial_obs, model_params, model_states, mi_params, Q_params, env_Q_params, key):
         next_obs_network = model_functions['next_obs']
         reward_network = model_functions['reward']
         termination_network = model_functions['termination']
-        prior_network = model_functions['prior']
+        prior_func = model_functions['prior']
 
         next_obs_params = model_params['next_obs']
         reward_params = model_params['reward']
@@ -263,11 +291,24 @@ def get_single_model_rollout_func(model_functions, mi_functions, Q_function, rol
                 raise ValueError("Unknown Exploration Strategy.")
 
             key, subkey = jx.random.split(key)
+
+
             if config.embedding_prior:
                 embedding_categorical = embedding_prior_network(embedding_prior_params, obs, jnp.eye(num_actions)[action])
-                quantized = prior_network(embedding_categorical['logits'], encoder_params, encoder_state, subkey)
+                quantized, embedding_indices = prior_func(embedding_categorical['logits'], encoder_params, encoder_state, subkey)
+
+                prior_mask = jnp.where(
+                    jnp.greater(jx.nn.softmax(embedding_categorical['logits']), config.min_env_Q_prior),
+                    0, -jnp.inf)
+
+                embedding_indices_env = jnp.argmax(prior_mask + env_Q_function(SG(env_Q_params), obs, jnp.eye(num_actions)[action]))
+                quantized_env, _estate = quantize_fun.apply(encoder_params, encoder_state, embedding_indices_env)
+
+                env_mask = jnp.less(jx.random.uniform(subkey), config.env_q_rollout_impact)
+                embedding_indices = jnp.where(env_mask, embedding_indices_env, embedding_indices)
+                quantized = jnp.where(env_mask, quantized_env, quantized)
             else:
-                quantized = prior_network(jnp.log(prior_state), encoder_params, encoder_state, subkey)
+                quantized, embedding_indices = prior_func(jnp.log(prior_state), encoder_params, encoder_state, subkey)
 
             r_dist = reward_network(reward_params, obs, jnp.eye(num_actions)[action], quantized)
             reward = r_dist["mu"]
@@ -278,7 +319,8 @@ def get_single_model_rollout_func(model_functions, mi_functions, Q_function, rol
             obs, _ = next_obs_network(next_obs_params, obs, jnp.eye(num_actions)[action], quantized, subkey)
 
             continuation_prob = jnp.exp(log_binary_probability(True, gamma_dist))
-            return (obs, continuation_prob, weight, key), (last_obs, action, reward, obs, continuation_prob, weight)
+            return (obs, continuation_prob, weight, key), (last_obs, action, reward, obs, continuation_prob, weight,
+                                                           embedding_indices)
 
         key, subkey = jx.random.split(key)
         _, sample_transitions = jx.lax.scan(loop_function, (initial_obs.astype(float), 1.0, 1.0, subkey), None,
@@ -288,13 +330,18 @@ def get_single_model_rollout_func(model_functions, mi_functions, Q_function, rol
     return single_model_rollout_func
 
 
-def get_agent_environment_interaction_loop_function(env, Q_function, model_functions, mi_functions,
-                                                    Q_opt_update, model_opt_update, mi_opt_update,
-                                                    get_Q_params, get_model_params, get_mi_params,
+def get_agent_environment_interaction_loop_function(env, Q_function, model_functions, mi_functions, env_Q_function,
+                                                    Q_opt_update, model_opt_update, mi_opt_update, env_Q_opt_update,
+                                                    get_Q_params, get_model_params, get_mi_params, get_env_Q_params,
                                                     replay_buffer, num_iterations,
                                                     num_actions):
     batch_Q_loss = lambda *x: jnp.mean(
-        vmap(get_single_sample_Q_loss(Q_function), in_axes=(None, None, 0, 0, 0, 0, 0, 0))(*x))
+        vmap(get_single_sample_Q_loss(Q_function), in_axes=(None, None, 0, 0, 0, 0, 0, 0, 0))(*x))
+
+    batch_env_Q_loss = lambda *x: jnp.mean(
+        #env_Q_params, env_Q_target_params,Q_target_params, curr_obs, action, reward, next_obs, continuation_prob, weight, quantization
+        vmap(get_single_sample_env_Q_loss(env_Q_function, Q_function, mi_functions),
+             in_axes=(None, None, None, None, 0, 0, 0, 0, 0, 0, 0))(*x))
     def batch_model_loss(*x):
         loss, (model_states, metrics) = get_single_batch_model_loss(model_functions, mi_functions, config.binary_obs)(*x)
         return jnp.mean(loss), (model_states, jx.tree_util.tree_map(jnp.mean, metrics))
@@ -306,12 +353,13 @@ def get_agent_environment_interaction_loop_function(env, Q_function, model_funct
     Q_loss_grad = grad(batch_Q_loss)
     model_loss_grad = grad(batch_model_loss, has_aux=True)
     mi_loss_grad = grad(batch_mi_loss, has_aux=True)
+    env_Q_loss_grad = grad(batch_env_Q_loss)
 
     batch_model_rollout = lambda *x: [jnp.reshape(y, (config.batch_size * config.rollout_length, -1)) for y in vmap(
-        get_single_model_rollout_func(model_functions, mi_functions, Q_function, config.rollout_length, num_actions),
-        in_axes=(0, None, None, None, None, 0))(*x)]
+        get_single_model_rollout_func(model_functions, mi_functions, Q_function, env_Q_function, config.rollout_length, num_actions),
+        in_axes=(0, None, None, None, None, None, 0))(*x)]
 
-    def agent_environment_interaction_loop_function(env_state, Q_opt_state, Q_target_params, model_opt_state,
+    def agent_environment_interaction_loop_function(env_state, Q_opt_state, Q_target_params,  env_Q_opt_state, env_Q_target_params, model_opt_state,
                                                     model_states, mi_opt_state, buffer_state, opt_t, t, key, train):
         obs = env.get_observation(env_state)
         metrics = {
@@ -330,7 +378,7 @@ def get_agent_environment_interaction_loop_function(env, Q_function, model_funct
             'embedding_prior_loss': 0.0,
         }
         def loop_function(carry, data):
-            env_state, Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics, obs, key = carry
+            env_state, Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics, obs, key = carry
             key, subkey = jx.random.split(key)
             Q_curr = Q_function(get_Q_params(Q_opt_state), obs.astype(float))
             metrics['avg_Q'] += jnp.max(Q_curr)
@@ -355,11 +403,16 @@ def get_agent_environment_interaction_loop_function(env, Q_function, model_funct
                 if (config.use_target):
                     Q_target_params = jx.tree_map(lambda x, y: jnp.where(t % config.target_update_frequency == 0, x, y),
                                                   get_Q_params(Q_opt_state), Q_target_params)
+                    if config.train_env_Q:
+                        env_Q_target_params = jx.tree_map(lambda x, y: jnp.where(t % config.target_update_frequency == 0, x, y),
+                                                      get_env_Q_params(env_Q_opt_state), env_Q_target_params)
                 else:
                     Q_target_params = get_Q_params(Q_opt_state)
+                    if config.train_env_Q:
+                        env_Q_target_params = get_env_Q_params(env_Q_opt_state)
 
                 def update_loop_function(carry, data):
-                    Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, metrics, key = carry
+                    Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, metrics, key = carry
                     buffer_state, sample_transitions = replay_buffer.sample(buffer_state)
                     key, subkey = jx.random.split(key)
                     # subkeys = jx.random.split(subkey, num=config.batch_size)
@@ -377,36 +430,42 @@ def get_agent_environment_interaction_loop_function(env, Q_function, model_funct
                     subkeys = jx.random.split(subkey, num=config.batch_size)
                     model_transitions = batch_model_rollout(sample_obs, get_model_params(model_opt_state), model_states,
                                                             get_mi_params(mi_opt_state),
-                                                            get_Q_params(Q_opt_state), subkeys)
+                                                            get_Q_params(Q_opt_state),
+                                                            get_env_Q_params(env_Q_opt_state), subkeys)
 
                     Q_grad = Q_loss_grad(get_Q_params(Q_opt_state), Q_target_params, *model_transitions)
                     Q_opt_state = Q_opt_update(opt_t, Q_grad, Q_opt_state)
 
+                    if config.train_env_Q:
+                        env_Q_grad = env_Q_loss_grad(get_env_Q_params(env_Q_opt_state), env_Q_target_params, Q_target_params, get_mi_params(mi_opt_state), *model_transitions)
+                        env_Q_opt_state = env_Q_opt_update(opt_t, env_Q_grad, env_Q_opt_state)
+
                     opt_t += 1
-                    return (Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, metrics, key), None
+                    return (Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, metrics, key), None
 
                 key, subkey = jx.random.split(key)
-                carry = (Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, metrics, subkey)
-                (Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, metrics, _), _ = jx.lax.scan(
+                carry = (Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, metrics, subkey)
+                (Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states,
+                 mi_opt_state, buffer_state, opt_t, metrics, _), _ = jx.lax.scan(
                     update_loop_function, carry, None, length=config.updates_per_step)
             metrics['avg_reward'] += reward
             t += 1
             return (
-            env_state, Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics,
+            env_state, Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics,
             obs, key), None
 
         key, subkey = jx.random.split(key)
 
         carry = (
-        env_state, Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics, obs,
+        env_state, Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics, obs,
         subkey)
 
-        (env_state, Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics, obs,
+        (env_state, Q_opt_state, Q_target_params,  env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics, obs,
          _), _ = jx.lax.scan(loop_function, carry, None, length=num_iterations)
         for mk, v in metrics.items():
             metrics[mk] = v / num_iterations
 
-        return env_state, Q_opt_state, Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics
+        return env_state, Q_opt_state, Q_target_params, env_Q_opt_state, env_Q_target_params, model_opt_state, model_states, mi_opt_state, buffer_state, opt_t, t, metrics
 
     return jit(agent_environment_interaction_loop_function, static_argnames=('train',))
 
@@ -579,13 +638,21 @@ quantize_fun = hk.without_apply_rng(
 
 
 def prior_func(prior_logits, encoder_params, encoder_state, key):
-    out, enc_state = quantize_fun.apply(encoder_params, encoder_state,
-                                        jx.random.categorical(key, prior_logits))
-    return jx.lax.stop_gradient(out)
+    embedding_indices = jx.random.categorical(key, prior_logits)
+    quantized, enc_state = quantize_fun.apply(encoder_params, encoder_state, embedding_indices)
+    return jx.lax.stop_gradient(quantized), embedding_indices
 
 
 prior_state = jnp.zeros((config.num_seeds, config.num_embeddings), dtype=float)
 
+
+env_Q_net = hk.without_apply_rng(hk.transform(lambda obs, a: Q_function(config, config.num_embeddings)(jnp.hstack([obs, a]))))
+key, subkey = jx.random.split(key)
+subkeys = jx.random.split(subkey, num=config.num_seeds)
+env_Q_params = [env_Q_net.init(subkey, obs.astype(float), dummy_a) for subkey in subkeys]
+env_Q_func = env_Q_net.apply
+
+env_Q_target_params = tree_stack(env_Q_params)
 
 model_funcs = {"reward": reward_func, "termination": termination_func, "next_obs": next_obs_func,
                "encoder": encoder_func, "prior": prior_func}
@@ -627,6 +694,11 @@ Q_opt_init, Q_opt_update, get_Q_params = adamw(config.Q_alpha, eps=config.eps_ad
 Q_opt_states = tree_stack([Q_opt_init(p) for p in Q_params])
 Q_opt_update = jit(Q_opt_update)
 
+env_Q_opt_init, env_Q_opt_update, get_env_Q_params = adamw(config.Q_alpha, eps=config.eps_adam, b1=config.b1_adam,
+                                                           b2=config.b2_adam, wd=config.wd_adam)
+env_Q_opt_states = tree_stack([env_Q_opt_init(p) for p in env_Q_params])
+env_Q_opt_update = jit(env_Q_opt_update)
+
 model_opt_init, model_opt_update, get_model_params = adamw(config.model_alpha, eps=config.eps_adam, b1=config.b1_adam,
                                                            b2=config.b2_adam, wd=config.wd_adam)
 model_opt_states = tree_stack([model_opt_init(p) for p in model_params])
@@ -644,9 +716,11 @@ key, subkey = jx.random.split(key)
 subkeys = jx.random.split(subkey, num=config.num_seeds)
 buffer_states = tree_stack([buffer.initialize(subkey) for subkey in subkeys])
 
-interaction_loop = get_agent_environment_interaction_loop_function(env, Q_func, model_funcs, mi_funcs, Q_opt_update,
-                                                                   model_opt_update, mi_opt_update,
+interaction_loop = get_agent_environment_interaction_loop_function(env, Q_func, model_funcs, mi_funcs, env_Q_func,
+                                                                   Q_opt_update,
+                                                                   model_opt_update, mi_opt_update, env_Q_opt_update,
                                                                    get_Q_params, get_model_params, get_mi_params,
+                                                                   get_env_Q_params,
                                                                    buffer, config.eval_frequency, num_actions)
 
 if (config.episodic_env):
@@ -659,7 +733,7 @@ else:
         in_axes=(None, None, 0))(*x)))
 
 multiseed_interaction_loop = jit(
-    vmap(interaction_loop, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, 0, None), out_axes=(0, 0, 0, 0, 0, 0, 0, None, None, 0)),
+    vmap(interaction_loop, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, 0, None), out_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, 0)),
     static_argnames='train')
 
 multiseed_eval_agent = jit(vmap(eval_agent, in_axes=(0, 0, 0)))
@@ -681,15 +755,16 @@ for i in tqdm(range(config.num_steps // config.eval_frequency)):
             pkl.dump({
                 'model': [get_model_params(model_opt_state) for model_opt_state in tree_unstack(model_opt_states)],
                 'mi': [get_mi_params(mi_opt_state) for mi_opt_state in tree_unstack(mi_opt_states)],
-                'Q': [get_Q_params(Q_opt_state) for Q_opt_state in tree_unstack(Q_opt_states)]
+                'Q': [get_Q_params(Q_opt_state) for Q_opt_state in tree_unstack(Q_opt_states)],
+                'env_Q': [get_env_Q_params(env_Q_opt_state) for env_Q_opt_state in tree_unstack(env_Q_opt_states)]
             }, f)
         time_since_last_save = 0
 
     # Train step
     key, subkey = jx.random.split(key)
     subkeys = jx.random.split(subkey, num=config.num_seeds)
-    env_states, Q_opt_states, Q_target_params, model_opt_states, model_states, mi_opt_states, buffer_states, opt_t, t, train_metrics = multiseed_interaction_loop(
-        env_states, Q_opt_states, Q_target_params, model_opt_states, model_states, mi_opt_states, buffer_states, opt_t, t, subkeys,
+    env_states, Q_opt_states, Q_target_params, env_Q_opt_states, env_Q_target_params, model_opt_states, model_states, mi_opt_states, buffer_states, opt_t, t, train_metrics = multiseed_interaction_loop(
+        env_states, Q_opt_states, Q_target_params, env_Q_opt_states, env_Q_target_params, model_opt_states, model_states, mi_opt_states, buffer_states, opt_t, t, subkeys,
         time >= config.training_start_time)
 
     # Evaluation step
@@ -720,7 +795,8 @@ if (config.save_params):
         pkl.dump({
             'model': [get_model_params(model_opt_state) for model_opt_state in tree_unstack(model_opt_states)],
             'mi': [get_mi_params(mi_opt_state) for mi_opt_state in tree_unstack(mi_opt_states)],
-            'Q': [get_Q_params(Q_opt_state) for Q_opt_state in tree_unstack(Q_opt_states)]
+            'Q': [get_Q_params(Q_opt_state) for Q_opt_state in tree_unstack(Q_opt_states)],
+            'env_Q': [get_env_Q_params(env_Q_opt_state) for env_Q_opt_state in tree_unstack(env_Q_opt_states)]
         }, f)
     with open('out/' + args.output + ".states", 'wb') as f:
         pkl.dump({

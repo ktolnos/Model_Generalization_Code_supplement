@@ -383,15 +383,15 @@ class EnemyWalk:
 
         empty_grid = jnp.ones((self.grid_size, self.grid_size), dtype=bool)
         enemy_coords = jnp.zeros((self.num_enemies, 2), dtype=int)
-        empty_grid = empty_grid.at[pos[0], pos[1]].set(0)
-        empty_grid = empty_grid.at[goal[0], goal[1]].set(0)
+        empty_grid = empty_grid.at[pos[0], pos[1]].set(False)
+        empty_grid = empty_grid.at[goal[0], goal[1]].set(False)
 
         def add_enemy(i, carry):
             key, empty_grid, enemy_coords = carry
             key, subkey = jx.random.split(key)
             enemy_pos = jx.random.choice(subkey, self.grid_size * self.grid_size, p=jnp.ravel(empty_grid))
             enemy_pos = jnp.stack(list(jnp.unravel_index(enemy_pos, (self.grid_size, self.grid_size))))
-            empty_grid = empty_grid.at[enemy_pos[0], enemy_pos[1]].set(0)
+            empty_grid = empty_grid.at[enemy_pos[0], enemy_pos[1]].set(False)
             enemy_coords = enemy_coords.at[i].set(enemy_pos)
             return subkey, empty_grid, enemy_coords
 

@@ -10,7 +10,7 @@
 "softmax_temp":0.8,
 "exploration_strat":"softmax",
 "batch_size":32,
-"num_seeds":30,
+"num_seeds":10,
 "target_update_frequency":100,
 "use_target":true,
 "rollout_length":10,
@@ -43,5 +43,8 @@
 "obs_mi": false,
 "act_mi": false,
 "mi_loss_weight": 0,
-"embedding_prior": true
+"embedding_prior": true,
+"train_env_Q": true,
+"min_env_Q_prior": 0.062,
+"env_q_rollout_impact": 0.5
 }
